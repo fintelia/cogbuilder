@@ -2,7 +2,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const TILE_SIZE: u32 = 1024;
 
-const NUM_TAGS: u32 = 11;
+const NUM_TAGS: u32 = 12;
 const OFFSETS_TAG_INDEX: u64 = 8;
 const LENGTHS_TAG_INDEX: u64 = 9;
 
@@ -136,9 +136,11 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
             ifd.extend_from_slice(&[0x15, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
             ifd.extend_from_slice((bpp.len() as u64).to_le_bytes().as_slice());
 
-            // TIFF tile width + height
+            // TIFF tile width
             ifd.extend_from_slice(&[0x42, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
             ifd.extend_from_slice((TILE_SIZE as u64).to_le_bytes().as_slice());
+
+            // TIFF tile height
             ifd.extend_from_slice(&[0x43, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
             ifd.extend_from_slice((TILE_SIZE as u64).to_le_bytes().as_slice());
 
@@ -294,7 +296,7 @@ mod tests {
     #[test]
     fn it_works() {
         let file = std::fs::File::create("test.tiff").unwrap();
-        let mut builder = CogBuilder::new(file, 4096, 4096, 8).unwrap();
+        let mut builder = CogBuilder::new(file, 4096, 4096, vec![8], false, "0").unwrap();
         let compressed = compress_tile(&vec![255u8; 1024 * 1024]);
         let compressed2 = compress_tile(&vec![127u8; 1024 * 1024]);
 
