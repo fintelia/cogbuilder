@@ -1,4 +1,4 @@
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const TILE_SIZE: u32 = 1024;
 
@@ -28,8 +28,8 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
         bpp: Vec<u8>,
         signed: bool,
         _nodata: &str,
-    ) -> Result<Self, io::Error> {
-        let mut file_size = file.seek(SeekFrom::End(0))?;
+    ) -> Result<Self, anyhow::Error> {
+        let original_file_size = file.seek(SeekFrom::End(0))?;
 
         let mut widths = Vec::new();
         let mut heights = Vec::new();
@@ -51,129 +51,161 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
             overview_height = (overview_height + 1) / 2;
         }
 
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut single_offset_size = (1u64, 0u64);
         let total_tiles = tile_counts.iter().map(|&c| c as u64).sum::<u64>();
-        if file_size < 1024 * tile_counts.len() as u64 + 16 * total_tiles {
+        let new_file_size =
+            (1024 * tile_counts.len() as u64 + 16 * total_tiles).max(original_file_size);
+        if original_file_size >= 1024 * tile_counts.len() as u64 {
+            let mut ifd_buffers = vec![0; 1024 * tile_counts.len()];
+            file.read_exact(&mut ifd_buffers)?;
             file.seek(SeekFrom::Start(0))?;
 
-            let mut data = Vec::new();
-            let mut indexes_offset = tile_counts.len() as u64 * 1024;
-            data.extend_from_slice(&[73, 73, 43, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0]);
-            for level in 0..tile_counts.len() {
-                let mut ifd = Vec::new();
-
-                // Number of tags
-                ifd.extend_from_slice((NUM_TAGS as u64).to_le_bytes().as_slice());
-
-                // TIFF new SubfileType
-                ifd.extend_from_slice(&[0xFE, 0, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                if level == 0 {
-                    ifd.extend_from_slice(&[0; 8]);
-                } else {
-                    ifd.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
-                }
-
-                // TIFF width
-                ifd.extend_from_slice(&[0, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                ifd.extend_from_slice((widths[level] as u64).to_le_bytes().as_slice());
-
-                // TIFF height
-                ifd.extend_from_slice(&[1, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                ifd.extend_from_slice((heights[level] as u64).to_le_bytes().as_slice());
-
-                // TIFF bits per sample
-                assert!(!bpp.is_empty() && bpp.len() <= 8);
-                ifd.extend_from_slice(&[2, 1, 1, 0, bpp.len() as u8, 0, 0, 0, 0, 0, 0, 0]);
-                ifd.extend_from_slice(&bpp);
-                ifd.extend_from_slice(&[0; 8][..8 - bpp.len()]);
-
-                // TIFF compression
-                ifd.extend_from_slice(&[3, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                ifd.extend_from_slice(5u64.to_le_bytes().as_slice());
-
-                // TIFF photometric interpretation
-                ifd.extend_from_slice(&[6, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                if bpp.len() == 3 {
-                    ifd.extend_from_slice(2u64.to_le_bytes().as_slice());
-                } else {
-                    ifd.extend_from_slice(1u64.to_le_bytes().as_slice());
-                }
-
-                // TIFF samples per pixel
-                ifd.extend_from_slice(&[0x15, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                ifd.extend_from_slice((bpp.len() as u64).to_le_bytes().as_slice());
-
-                // TIFF tile width + height
-                ifd.extend_from_slice(&[0x42, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                ifd.extend_from_slice((TILE_SIZE as u64).to_le_bytes().as_slice());
-                ifd.extend_from_slice(&[0x43, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                ifd.extend_from_slice((TILE_SIZE as u64).to_le_bytes().as_slice());
-
-                // TIFF tile offsets
-                ifd.extend_from_slice(&[0x44, 1, 16, 0]);
-                ifd.extend_from_slice((tile_counts[level] as u64).to_le_bytes().as_slice());
-                if tile_counts[level] > 1 {
-                    ifd.extend_from_slice(indexes_offset.to_le_bytes().as_slice());
-                } else {
-                    ifd.extend_from_slice(1u64.to_le_bytes().as_slice());
-                }
-
-                // TIFF tile sizes
-                ifd.extend_from_slice(&[0x45, 1, 16, 0]);
-                ifd.extend_from_slice((tile_counts[level] as u64).to_le_bytes().as_slice());
-                if tile_counts[level] > 1 {
-                    ifd.extend_from_slice(
-                        (indexes_offset + tile_counts[level] as u64 * 8)
-                            .to_le_bytes()
-                            .as_slice(),
+            let mut ifd_offset = 16;
+            for i in 0..tile_counts.len() {
+                let num_tags =
+                    u64::from_le_bytes(ifd_buffers[ifd_offset..][..8].try_into().unwrap()) as usize;
+                for tag in 0..num_tags {
+                    let kind = u16::from_le_bytes(
+                        ifd_buffers[ifd_offset + 8 + 20 * tag..][..2]
+                            .try_into()
+                            .unwrap(),
                     );
-                } else {
-                    ifd.extend_from_slice(&[0; 8]);
+                    let value = u64::from_le_bytes(
+                        ifd_buffers[ifd_offset + 8 + 20 * tag + 12..][..8]
+                            .try_into()
+                            .unwrap(),
+                    );
+
+                    match kind {
+                        0x144 if tile_counts[i] == 1 => single_offset_size.0 = value,
+                        0x145 if tile_counts[i] == 1 => single_offset_size.1 = value,
+                        _ => (),
+                    }
                 }
 
-                // TIFF sample format
-                ifd.extend_from_slice(&[0x53, 1, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-                if signed {
-                    ifd.extend_from_slice(2u64.to_le_bytes().as_slice());
-                } else {
-                    ifd.extend_from_slice(1u64.to_le_bytes().as_slice());
-                }
+                ifd_offset = 1024 * (i + 1);
+            }
+        }
 
-                // // GDAL nodata
-                // assert!(nodata.len() < 8);
-                // ifd.extend_from_slice(&[0x81, 0xA4, 2, 0, nodata.len() as u8 + 1, 0, 0, 0, 0, 0, 0, 0]);
-                // ifd.extend_from_slice(nodata.as_bytes());
-                // ifd.extend_from_slice(&[0; 8][..8 - nodata.len()]);
+        let mut data = Vec::new();
+        let mut indexes_offset = tile_counts.len() as u64 * 1024;
+        data.extend_from_slice(&[73, 73, 43, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0]);
+        for level in 0..tile_counts.len() {
+            let mut ifd = Vec::new();
 
-                // Next IFD
-                if level < tile_counts.len() - 1 {
-                    ifd.extend_from_slice(((level + 1) as u64 * 1024).to_le_bytes().as_slice());
-                } else {
-                    ifd.extend_from_slice(&[0; 8]);
-                }
+            // Number of tags
+            ifd.extend_from_slice((NUM_TAGS as u64).to_le_bytes().as_slice());
 
-                assert!(ifd.len() <= 1000);
-                data.extend_from_slice(&ifd);
-                data.extend_from_slice(&vec![0; 1024 - (data.len() % 1024)]);
-
-                indexes_offset += tile_counts[level] as u64 * 16;
+            // TIFF new SubfileType
+            ifd.extend_from_slice(&[0xFE, 0, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            if level == 0 {
+                ifd.extend_from_slice(&[0; 8]);
+            } else {
+                ifd.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
             }
 
-            file.write_all(&data)?;
-            for &tiles in &tile_counts {
-                file.write_all(
-                    &*1u64
+            // TIFF width
+            ifd.extend_from_slice(&[0, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            ifd.extend_from_slice((widths[level] as u64).to_le_bytes().as_slice());
+
+            // TIFF height
+            ifd.extend_from_slice(&[1, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            ifd.extend_from_slice((heights[level] as u64).to_le_bytes().as_slice());
+
+            // TIFF bits per sample
+            assert!(!bpp.is_empty() && bpp.len() <= 8);
+            ifd.extend_from_slice(&[2, 1, 1, 0, bpp.len() as u8, 0, 0, 0, 0, 0, 0, 0]);
+            ifd.extend_from_slice(&bpp);
+            ifd.extend_from_slice(&[0; 8][..8 - bpp.len()]);
+
+            // TIFF compression
+            ifd.extend_from_slice(&[3, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            ifd.extend_from_slice(5u64.to_le_bytes().as_slice());
+
+            // TIFF photometric interpretation
+            ifd.extend_from_slice(&[6, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            if bpp.len() == 3 {
+                ifd.extend_from_slice(2u64.to_le_bytes().as_slice());
+            } else {
+                ifd.extend_from_slice(1u64.to_le_bytes().as_slice());
+            }
+
+            // TIFF samples per pixel
+            ifd.extend_from_slice(&[0x15, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            ifd.extend_from_slice((bpp.len() as u64).to_le_bytes().as_slice());
+
+            // TIFF tile width + height
+            ifd.extend_from_slice(&[0x42, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            ifd.extend_from_slice((TILE_SIZE as u64).to_le_bytes().as_slice());
+            ifd.extend_from_slice(&[0x43, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            ifd.extend_from_slice((TILE_SIZE as u64).to_le_bytes().as_slice());
+
+            // TIFF tile offsets
+            ifd.extend_from_slice(&[0x44, 1, 16, 0]);
+            ifd.extend_from_slice((tile_counts[level] as u64).to_le_bytes().as_slice());
+            if tile_counts[level] > 1 {
+                ifd.extend_from_slice(indexes_offset.to_le_bytes().as_slice());
+            } else {
+                ifd.extend_from_slice(single_offset_size.0.to_le_bytes().as_slice());
+            }
+
+            // TIFF tile sizes
+            ifd.extend_from_slice(&[0x45, 1, 16, 0]);
+            ifd.extend_from_slice((tile_counts[level] as u64).to_le_bytes().as_slice());
+            if tile_counts[level] > 1 {
+                ifd.extend_from_slice(
+                    (indexes_offset + tile_counts[level] as u64 * 8)
                         .to_le_bytes()
-                        .as_slice()
-                        .iter()
-                        .cycle()
-                        .take(tiles as usize * 8)
-                        .copied()
-                        .collect::<Vec<u8>>(),
-                )?;
-                file.write_all(&vec![0; tiles as usize * 8])?;
+                        .as_slice(),
+                );
+            } else {
+                ifd.extend_from_slice(single_offset_size.1.to_le_bytes().as_slice());
             }
 
-            file_size = 1024 * tile_counts.len() as u64 + 16 * total_tiles;
+            // TIFF sample format
+            ifd.extend_from_slice(&[0x53, 1, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            if signed {
+                ifd.extend_from_slice(2u64.to_le_bytes().as_slice());
+            } else {
+                ifd.extend_from_slice(1u64.to_le_bytes().as_slice());
+            }
+
+            // // GDAL nodata
+            // assert!(nodata.len() < 8);
+            // ifd.extend_from_slice(&[0x81, 0xA4, 2, 0, nodata.len() as u8 + 1, 0, 0, 0, 0, 0, 0, 0]);
+            // ifd.extend_from_slice(nodata.as_bytes());
+            // ifd.extend_from_slice(&[0; 8][..8 - nodata.len()]);
+
+            // Next IFD
+            if level < tile_counts.len() - 1 {
+                ifd.extend_from_slice(((level + 1) as u64 * 1024).to_le_bytes().as_slice());
+            } else {
+                ifd.extend_from_slice(&[0; 8]);
+            }
+
+            assert!(ifd.len() <= 1000);
+            data.extend_from_slice(&ifd);
+            data.extend_from_slice(&vec![0; 1024 - (data.len() % 1024)]);
+
+            indexes_offset += tile_counts[level] as u64 * 16;
+        }
+
+        file.write_all(&data)?;
+
+        if original_file_size < new_file_size {
+            if original_file_size > data.len() as u64 {
+                file.seek(SeekFrom::Start(original_file_size))?;
+            }
+
+            let mut tile_data = Vec::new();
+            for &tiles in &tile_counts {
+                tile_data.extend_from_slice(&vec![1u64; tiles as usize]);
+                tile_data.extend_from_slice(&vec![0u64; tiles as usize]);
+            }
+            let buf = bytemuck::cast_slice(&tile_data);
+            file.write_all(&buf[(original_file_size as usize).saturating_sub(data.len())..])?;
         }
 
         Ok(CogBuilder {
@@ -181,7 +213,7 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
             widths,
             heights,
             tile_counts,
-            file_size,
+            file_size: new_file_size,
         })
     }
 
@@ -216,7 +248,7 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
         }
     }
 
-    pub fn valid_mask(&mut self, level: u32) -> Result<Vec<bool>, io::Error> {
+    pub fn valid_mask(&mut self, level: u32) -> Result<Vec<bool>, anyhow::Error> {
         let start = self.offset_size_locations(level, 0).0;
 
         let mut data = vec![0u64; self.tile_counts[level as usize] as usize];
@@ -226,7 +258,7 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
         Ok(data.into_iter().map(|offset| offset != 1).collect())
     }
 
-    pub fn write_tile(&mut self, level: u32, index: u32, tile: &[u8]) -> Result<(), io::Error> {
+    pub fn write_tile(&mut self, level: u32, index: u32, tile: &[u8]) -> Result<(), anyhow::Error> {
         let file_end = self.file.seek(SeekFrom::End(0))?;
         assert_eq!(self.file_size, file_end);
 
@@ -246,12 +278,12 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
         Ok(())
     }
 
-    pub fn write_nodata_tile(&mut self, level: u32, index: u32) -> Result<(), io::Error> {
+    pub fn write_nodata_tile(&mut self, level: u32, index: u32) -> Result<(), anyhow::Error> {
         let offset_location = self.offset_size_locations(level, index).0;
 
         self.file.seek(SeekFrom::Start(offset_location))?;
         self.file.write_all(&0u64.to_le_bytes())?;
-        self.file.flush()
+        Ok(self.file.flush()?)
     }
 }
 
