@@ -12,6 +12,10 @@ pub fn compress_tile(data: &[u8]) -> Vec<u8> {
         .unwrap()
 }
 
+pub fn decompress_tile(data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
+    Ok(weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).decode(data)?)
+}
+
 pub struct CogBuilder<F> {
     file: F,
     widths: Vec<u32>,
@@ -225,6 +229,15 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
     pub fn height(&self, level: u32) -> u32 {
         self.heights[level as usize]
     }
+    pub fn tiles_across(&self, level: u32) -> u32 {
+        (self.widths[level as usize] + TILE_SIZE - 1) / TILE_SIZE
+    }
+    pub fn tiles_down(&self, level: u32) -> u32 {
+        (self.heights[level as usize] + TILE_SIZE - 1) / TILE_SIZE
+    }
+    pub fn levels(&self) -> u32 {
+        self.tile_counts.len() as u32
+    }
 
     fn offset_size_locations(&self, level: u32, tile_index: u32) -> (u64, u64) {
         if self.tile_counts[level as usize] > 1 {
@@ -238,11 +251,13 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
             let size_location = offset_location + self.tile_counts[level as usize] as u64 * 8;
             (offset_location, size_location)
         } else if level == 0 {
+            assert_eq!(tile_index, 0);
             (
                 16 + 8 + OFFSETS_TAG_INDEX * 20 + 12,
                 16 + 8 + LENGTHS_TAG_INDEX * 20 + 12,
             )
         } else {
+            assert_eq!(tile_index, 0);
             (
                 1024 * level as u64 + 8 + OFFSETS_TAG_INDEX * 20 + 12,
                 1024 * level as u64 + 8 + LENGTHS_TAG_INDEX * 20 + 12,
@@ -286,6 +301,35 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
         self.file.seek(SeekFrom::Start(offset_location))?;
         self.file.write_all(&0u64.to_le_bytes())?;
         Ok(self.file.flush()?)
+    }
+
+    pub fn read_tile(&mut self, level: u32, index: u32) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        if index >= self.tile_counts[level as usize] {
+            return Ok(None);
+        }
+        let (offset_location, size_location) = self.offset_size_locations(level, index);
+
+        let mut offset = [0; 8];
+        let mut size = [0; 8];
+
+        self.file.seek(SeekFrom::Start(size_location))?;
+        self.file.read_exact(size.as_mut_slice())?;
+
+        self.file.seek(SeekFrom::Start(offset_location))?;
+        self.file.read_exact(offset.as_mut_slice())?;
+
+        let offset = u64::from_le_bytes(offset);
+        let size = u64::from_le_bytes(size);
+
+        if size == 0 {
+            return Ok(None);
+        }
+
+        let mut tile = vec![0; size as usize];
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(&mut tile)?;
+
+        Ok(Some(tile))
     }
 }
 
