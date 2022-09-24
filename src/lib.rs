@@ -3,8 +3,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 pub const TILE_SIZE: u32 = 1024;
 
 const NUM_TAGS: u32 = 12;
-const OFFSETS_TAG_INDEX: u64 = 8;
-const LENGTHS_TAG_INDEX: u64 = 9;
+const OFFSETS_TAG_INDEX: u64 = 9;
+const LENGTHS_TAG_INDEX: u64 = 10;
 
 pub fn compress_tile(data: &[u8]) -> Vec<u8> {
     weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
