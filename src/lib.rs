@@ -1,4 +1,12 @@
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{
+    borrow::BorrowMut,
+    cell::{RefCell, RefMut},
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
+
+use thread_local::ThreadLocal;
 
 pub const TILE_SIZE: u32 = 1024;
 
@@ -16,23 +24,45 @@ pub fn decompress_tile(data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
     Ok(weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).decode(data)?)
 }
 
-pub struct CogBuilder<F> {
-    file: F,
+pub struct CogBuilder {
+    path: PathBuf,
+    files: ThreadLocal<RefCell<File>>,
     widths: Vec<u32>,
     heights: Vec<u32>,
     tile_counts: Vec<u32>,
     file_size: u64,
 }
 
-impl<F: Read + Write + Seek> CogBuilder<F> {
+impl CogBuilder {
+    fn get_file(
+        files: &ThreadLocal<RefCell<File>>,
+        path: impl AsRef<Path>,
+    ) -> Result<RefMut<File>, std::io::Error> {
+        let refcell: &RefCell<_> = files.get_or_try(|| -> Result<RefCell<_>, std::io::Error> {
+            Ok(RefCell::new(
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(path)?,
+            ))
+        })?;
+        Ok(refcell.borrow_mut())
+    }
+    fn file(&self) -> Result<RefMut<File>, std::io::Error> {
+        Self::get_file(&self.files, &self.path)
+    }
+
     pub fn new(
-        mut file: F,
+        path: PathBuf,
         width: u32,
         height: u32,
         bpp: Vec<u8>,
         signed: bool,
         _nodata: &str,
     ) -> Result<Self, anyhow::Error> {
+        let files = ThreadLocal::new();
+        let mut  file = Self::get_file(&files, &path)?;
         let original_file_size = file.seek(SeekFrom::End(0))?;
 
         let mut widths = Vec::new();
@@ -214,8 +244,10 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
             file.write_all(&buf[(original_file_size as usize).saturating_sub(data.len())..])?;
         }
 
+        drop(file);
         Ok(CogBuilder {
-            file,
+            path,
+            files,
             widths,
             heights,
             tile_counts,
@@ -265,31 +297,34 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
         }
     }
 
-    pub fn valid_mask(&mut self, level: u32) -> Result<Vec<bool>, anyhow::Error> {
+    pub fn valid_mask(&self, level: u32) -> Result<Vec<bool>, anyhow::Error> {
         let start = self.offset_size_locations(level, 0).0;
 
         let mut data = vec![0u64; self.tile_counts[level as usize] as usize];
-        self.file.seek(SeekFrom::Start(start))?;
-        self.file.read_exact(bytemuck::cast_slice_mut(&mut data))?;
+        let mut file = self.file()?;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(bytemuck::cast_slice_mut(&mut data))?;
 
         Ok(data.into_iter().map(|offset| offset != 1).collect())
     }
 
     pub fn write_tile(&mut self, level: u32, index: u32, tile: &[u8]) -> Result<(), anyhow::Error> {
-        let file_end = self.file.seek(SeekFrom::End(0))?;
+        let file_end = { self.file()?.seek(SeekFrom::End(0))? };
         assert_eq!(self.file_size, file_end);
 
         let (offset_location, size_location) = self.offset_size_locations(level, index);
 
-        self.file.write_all(tile)?;
+        let mut file = self.file()?;
+        file.write_all(tile)?;
 
-        self.file.seek(SeekFrom::Start(size_location))?;
-        self.file.write_all(&(tile.len() as u64).to_le_bytes())?;
-        self.file.flush()?;
+        file.seek(SeekFrom::Start(size_location))?;
+        file.write_all(&(tile.len() as u64).to_le_bytes())?;
+        file.flush()?;
 
-        self.file.seek(SeekFrom::Start(offset_location))?;
-        self.file.write_all(&(file_end as u64).to_le_bytes())?;
-        self.file.flush()?;
+        file.seek(SeekFrom::Start(offset_location))?;
+        file.write_all(&(file_end as u64).to_le_bytes())?;
+        file.flush()?;
+        drop(file);
 
         self.file_size += tile.len() as u64;
         Ok(())
@@ -298,12 +333,13 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
     pub fn write_nodata_tile(&mut self, level: u32, index: u32) -> Result<(), anyhow::Error> {
         let offset_location = self.offset_size_locations(level, index).0;
 
-        self.file.seek(SeekFrom::Start(offset_location))?;
-        self.file.write_all(&0u64.to_le_bytes())?;
-        Ok(self.file.flush()?)
+        let mut file = self.file()?;
+        file.seek(SeekFrom::Start(offset_location))?;
+        file.write_all(&0u64.to_le_bytes())?;
+        Ok(file.flush()?)
     }
 
-    pub fn read_tile(&mut self, level: u32, index: u32) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    pub fn read_tile(&self, level: u32, index: u32) -> Result<Option<Vec<u8>>, anyhow::Error> {
         if index >= self.tile_counts[level as usize] {
             return Ok(None);
         }
@@ -312,11 +348,12 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
         let mut offset = [0; 8];
         let mut size = [0; 8];
 
-        self.file.seek(SeekFrom::Start(size_location))?;
-        self.file.read_exact(size.as_mut_slice())?;
+        let mut file = self.file()?;
+        file.seek(SeekFrom::Start(size_location))?;
+        file.read_exact(size.as_mut_slice())?;
 
-        self.file.seek(SeekFrom::Start(offset_location))?;
-        self.file.read_exact(offset.as_mut_slice())?;
+        file.seek(SeekFrom::Start(offset_location))?;
+        file.read_exact(offset.as_mut_slice())?;
 
         let offset = u64::from_le_bytes(offset);
         let size = u64::from_le_bytes(size);
@@ -326,8 +363,8 @@ impl<F: Read + Write + Seek> CogBuilder<F> {
         }
 
         let mut tile = vec![0; size as usize];
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut tile)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut tile)?;
 
         Ok(Some(tile))
     }
@@ -339,8 +376,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let file = std::fs::File::create("test.tiff").unwrap();
-        let mut builder = CogBuilder::new(file, 4096, 4096, vec![8], false, "0").unwrap();
+        let mut builder = CogBuilder::new("test.tiff".into(), 4096, 4096, vec![8], false, "0").unwrap();
         let compressed = compress_tile(&vec![255u8; 1024 * 1024]);
         let compressed2 = compress_tile(&vec![127u8; 1024 * 1024]);
 

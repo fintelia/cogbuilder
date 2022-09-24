@@ -8,4 +8,5 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.64"
 bytemuck = "1.11.0"
+thread_local = "1.1.4"
 weezl = "0.1.7"
