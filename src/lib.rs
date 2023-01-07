@@ -14,13 +14,15 @@ const OFFSETS_TAG_INDEX: u64 = 9;
 const LENGTHS_TAG_INDEX: u64 = 10;
 
 pub fn compress_tile(data: &[u8]) -> Vec<u8> {
-    weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
-        .encode(data)
-        .unwrap()
+    zstd::bulk::compress(data, 0).unwrap()
 }
 
 pub fn decompress_tile(data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
-    Ok(weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).decode(data)?)
+    let mut output = Vec::with_capacity((TILE_SIZE * TILE_SIZE) as usize / 8);
+    zstd::bulk::Decompressor::new()
+        .unwrap()
+        .decompress_to_buffer(data, &mut output)?;
+    Ok(output)
 }
 
 pub struct CogBuilder {
@@ -61,7 +63,7 @@ impl CogBuilder {
         _nodata: &str,
     ) -> Result<Self, anyhow::Error> {
         let files = ThreadLocal::new();
-        let mut  file = Self::get_file(&files, &path)?;
+        let mut file = Self::get_file(&files, &path)?;
         let original_file_size = file.seek(SeekFrom::End(0))?;
 
         let mut widths = Vec::new();
@@ -155,7 +157,7 @@ impl CogBuilder {
 
             // TIFF compression
             ifd.extend_from_slice(&[3, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
-            ifd.extend_from_slice(5u64.to_le_bytes().as_slice());
+            ifd.extend_from_slice(50000u64.to_le_bytes().as_slice());
 
             // TIFF photometric interpretation
             ifd.extend_from_slice(&[6, 1, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
@@ -375,7 +377,8 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let mut builder = CogBuilder::new("test.tiff".into(), 4096, 4096, vec![8], false, "0").unwrap();
+        let mut builder =
+            CogBuilder::new("test.tiff".into(), 4096, 4096, vec![8], false, "0").unwrap();
         let compressed = compress_tile(&vec![255u8; 1024 * 1024]);
         let compressed2 = compress_tile(&vec![127u8; 1024 * 1024]);
 
