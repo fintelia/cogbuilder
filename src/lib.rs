@@ -18,11 +18,7 @@ pub fn compress_tile(data: &[u8]) -> Vec<u8> {
 }
 
 pub fn decompress_tile(data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
-    let mut output = Vec::with_capacity((TILE_SIZE * TILE_SIZE) as usize / 8);
-    zstd::bulk::Decompressor::new()
-        .unwrap()
-        .decompress_to_buffer(data, &mut output)?;
-    Ok(output)
+    Ok(zstd::decode_all(data)?)
 }
 
 pub struct CogBuilder {
